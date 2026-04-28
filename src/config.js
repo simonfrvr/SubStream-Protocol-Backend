@@ -200,6 +200,16 @@ async function loadConfig(env = process.env, vaultService = null) {
       emailQueue: env.RABBITMQ_EMAIL_QUEUE || 'substream_emails_queue',
       leaderboardQueue: env.RABBITMQ_LEADERBOARD_QUEUE || 'substream_leaderboard_queue',
     },
+    databaseCircuitBreaker: {
+      failureThreshold: Number(env.DATABASE_CIRCUIT_BREAKER_FAILURE_THRESHOLD || 15),
+      resetTimeout: Number(env.DATABASE_CIRCUIT_BREAKER_RESET_TIMEOUT || 180000),
+      maxConcurrentWrites: Number(env.DATABASE_CIRCUIT_BREAKER_MAX_CONCURRENT_WRITES || 30),
+      writeTimeoutThreshold: Number(env.DATABASE_CIRCUIT_BREAKER_WRITE_TIMEOUT_THRESHOLD || 3000),
+      massUnlockThreshold: Number(env.DATABASE_CIRCUIT_BREAKER_MASS_UNLOCK_THRESHOLD || 50),
+      massUnlockWindow: Number(env.DATABASE_CIRCUIT_BREAKER_MASS_UNLOCK_WINDOW || 60000),
+      batchSize: Number(env.DATABASE_CIRCUIT_BREAKER_BATCH_SIZE || 5),
+      batchTimeout: Number(env.DATABASE_CIRCUIT_BREAKER_BATCH_TIMEOUT || 1000),
+    },
     substream: {
       baseDomain: env.SUBSTREAM_BASE_DOMAIN || 'substream.app',
       backendUrl: env.SUBSTREAM_BACKEND_URL || 'http://localhost:3000',

@@ -2,6 +2,8 @@ const { SorobanRpcService } = require('./sorobanRpcService');
 const { SorobanXdrParser } = require('../utils/sorobanXdrParser');
 const { SorobanDeadLetterQueue } = require('./sorobanDeadLetterQueue');
 const { AppDatabase } = require('../db/appDatabase');
+const { DatabaseCircuitBreaker } = require('../utils/databaseCircuitBreaker');
+const { DatabaseCircuitBreakerMonitor } = require('./databaseCircuitBreakerMonitor');
 
 /**
  * Soroban Event Indexer Service
@@ -27,6 +29,46 @@ class SorobanEventIndexer {
     
     // Pub/Sub integration
     this.eventPublisher = dependencies.eventPublisher || null;
+    
+    // Database Circuit Breaker for mass unlock protection
+    this.databaseCircuitBreaker = new DatabaseCircuitBreaker({
+      failureThreshold: config.databaseCircuitBreaker?.failureThreshold || 15,
+      resetTimeout: config.databaseCircuitBreaker?.resetTimeout || 180000, // 3 minutes
+      maxConcurrentWrites: config.databaseCircuitBreaker?.maxConcurrentWrites || 30,
+      writeTimeoutThreshold: config.databaseCircuitBreaker?.writeTimeoutThreshold || 3000,
+      massUnlockThreshold: config.databaseCircuitBreaker?.massUnlockThreshold || 50,
+      massUnlockWindow: config.databaseCircuitBreaker?.massUnlockWindow || 60000,
+      batchSize: config.databaseCircuitBreaker?.batchSize || 5,
+      onStateChange: (stateChange) => {
+        this.logger.warn('Database Circuit Breaker state change', stateChange);
+        if (this.circuitBreakerMonitor) {
+          this.circuitBreakerMonitor.onStateChange(stateChange);
+        }
+      },
+      onMassUnlockDetected: (massUnlock) => {
+        this.logger.warn('Mass unlock event detected', massUnlock);
+        if (this.circuitBreakerMonitor) {
+          this.circuitBreakerMonitor.onMassUnlockDetected(massUnlock);
+        }
+      },
+      onThrottlingAdjustment: (adjustment) => {
+        this.logger.info('Database throttling adjusted', adjustment);
+        if (this.circuitBreakerMonitor) {
+          this.circuitBreakerMonitor.onThrottlingAdjustment(adjustment);
+        }
+      }
+    });
+
+    // Database Circuit Breaker Monitor for alerting
+    this.circuitBreakerMonitor = new DatabaseCircuitBreakerMonitor(
+      config.databaseCircuitBreakerMonitor || { enabled: true },
+      {
+        logger: this.logger,
+        alertService: dependencies.alertService || null,
+        emailService: dependencies.emailService || null,
+        slackService: dependencies.slackService || null
+      }
+    );
     
     // Retry configuration
     this.maxRetries = config.maxRetries || 3;
@@ -69,6 +111,11 @@ class SorobanEventIndexer {
       
       // Initialize DLQ service
       await this.dlqService.initialize();
+      
+      // Initialize circuit breaker monitor
+      if (this.circuitBreakerMonitor) {
+        await this.circuitBreakerMonitor.initialize();
+      }
       
       // Start the main indexing loop
       this.isRunning = true;
@@ -372,12 +419,12 @@ class SorobanEventIndexer {
   }
 
   /**
-   * Store event in database with idempotent constraint
+   * Store event in database with idempotent constraint and circuit breaker protection
    */
   async storeEvent(parsedEvent) {
-    try {
-      const eventId = this.generateEventId();
-      
+    const eventId = this.generateEventId();
+    
+    const writeOperation = async () => {
       const stmt = this.database.db.prepare(`
         INSERT INTO soroban_events (
           id, contract_id, transaction_hash, event_index, ledger_sequence,
@@ -402,15 +449,37 @@ class SorobanEventIndexer {
       );
       
       return eventId;
+    };
+
+    try {
+      return await this.databaseCircuitBreaker.executeWrite(writeOperation, {
+        operation: 'storeEvent',
+        eventType: parsedEvent.type,
+        transactionHash: parsedEvent.transactionHash
+      });
     } catch (error) {
       // Check if this is a unique constraint violation (duplicate)
       if (error.message.includes('UNIQUE constraint failed') || 
-          error.message.includes('duplicate key')) {
+          error.message.includes('duplicate key') ||
+          error.message.includes('Duplicate event')) {
         this.logger.debug('Event already exists (idempotent constraint)', {
           transactionHash: parsedEvent.transactionHash,
           eventIndex: parsedEvent.eventIndex
         });
         throw new Error('Duplicate event');
+      }
+      
+      // Check if this is a circuit breaker error
+      if (error.message.includes('circuit breaker') || 
+          error.message.includes('Maximum concurrent writes') ||
+          error.message.includes('Database write timeout')) {
+        this.logger.warn('Database write rejected by circuit breaker', {
+          transactionHash: parsedEvent.transactionHash,
+          eventIndex: parsedEvent.eventIndex,
+          circuitBreakerState: this.databaseCircuitBreaker.getState().state,
+          error: error.message
+        });
+        throw new Error(`Database circuit breaker active: ${error.message}`);
       }
       
       this.logger.error('Failed to store event', {
@@ -472,10 +541,10 @@ class SorobanEventIndexer {
   }
 
   /**
-   * Update ingestion state in database
+   * Update ingestion state in database with circuit breaker protection
    */
   async updateIngestionState(ledgerSequence) {
-    try {
+    const writeOperation = async () => {
       const stmt = this.database.db.prepare(`
         INSERT INTO soroban_ingestion_state 
         (contract_id, last_ingested_ledger, last_ingested_timestamp)
@@ -492,7 +561,27 @@ class SorobanEventIndexer {
         ledgerSequence,
         new Date().toISOString()
       );
+    };
+
+    try {
+      await this.databaseCircuitBreaker.executeWrite(writeOperation, {
+        operation: 'updateIngestionState',
+        ledgerSequence
+      });
     } catch (error) {
+      // Circuit breaker errors are logged but don't stop processing
+      if (error.message.includes('circuit breaker') || 
+          error.message.includes('Maximum concurrent writes') ||
+          error.message.includes('Database write timeout')) {
+        this.logger.warn('Ingestion state update rejected by circuit breaker', {
+          ledgerSequence,
+          circuitBreakerState: this.databaseCircuitBreaker.getState().state,
+          error: error.message
+        });
+        // Don't throw - we can continue processing even if state update fails
+        return;
+      }
+      
       this.logger.error('Failed to update ingestion state', {
         ledgerSequence,
         error: error.message
@@ -522,7 +611,8 @@ class SorobanEventIndexer {
       lastProcessedLedger: this.lastProcessedLedger,
       isRunning: this.isRunning,
       contractId: this.contractId,
-      eventsPerSecond: uptime > 0 ? (this.stats.eventsProcessed / (uptime / 1000)).toFixed(2) : 0
+      eventsPerSecond: uptime > 0 ? (this.stats.eventsProcessed / (uptime / 1000)).toFixed(2) : 0,
+      databaseCircuitBreaker: this.databaseCircuitBreaker.getState()
     };
   }
 
@@ -533,18 +623,33 @@ class SorobanEventIndexer {
     try {
       const rpcHealth = await this.rpcService.getHealthStatus();
       const stats = this.getStats();
+      const circuitBreakerState = this.databaseCircuitBreaker.getState();
+      
+      // Consider system unhealthy if circuit breaker is open or heavily throttling
+      const databaseHealthy = circuitBreakerState.state !== 'OPEN' && 
+                           circuitBreakerState.throttlingLevel < 80;
       
       return {
-        healthy: this.isRunning && rpcHealth.healthy,
+        healthy: this.isRunning && rpcHealth.healthy && databaseHealthy,
         indexer: stats,
         rpc: rpcHealth,
-        database: 'connected' // Add actual DB health check if needed
+        database: {
+          connected: true,
+          circuitBreaker: circuitBreakerState,
+          healthy: databaseHealthy,
+          monitor: this.circuitBreakerMonitor ? this.circuitBreakerMonitor.getStats() : null,
+          performanceSummary: this.circuitBreakerMonitor ? this.circuitBreakerMonitor.getPerformanceSummary() : null
+        }
       };
     } catch (error) {
       return {
         healthy: false,
         error: error.message,
-        indexer: this.getStats()
+        indexer: this.getStats(),
+        database: {
+          connected: false,
+          circuitBreaker: this.databaseCircuitBreaker.getState()
+        }
       };
     }
   }
