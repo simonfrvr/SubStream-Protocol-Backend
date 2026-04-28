@@ -24,6 +24,10 @@ import { mpcRoutes } from './routes/mpc';
 import { auditRoutes } from './routes/audit';
 import { sandboxRoutes } from './routes/sandbox';
 import { merchantRoutes } from './routes/merchants';
+import { organizationRoutes } from './routes/organizations';
+import { invitationRoutes } from './routes/invitations';
+import { enhancedMerchantRoutes } from './routes/enhancedMerchants';
+import { memberAuthRoutes } from './routes/memberAuth';
 
 import { errorHandler } from './middleware/errorHandler';
 import { requestLogger } from './middleware/requestLogger';
@@ -189,6 +193,7 @@ const apiRouter = express.Router();
 
 // Apply specialized rate limiting to different route groups
 apiRouter.use('/auth', authRoutes); // Enhanced rate limiting applied above
+apiRouter.use('/auth/member', memberAuthRoutes); // Member authentication routes
 
 // Analytics and Query endpoints - Enhanced PQL rate limiting with stricter controls
 apiRouter.use('/analytics', enhancedRateLimiter ? enhancedRateLimiter.enhancedRateLimit({
@@ -218,6 +223,9 @@ apiRouter.use('/ipfs', ipfsRoutes);
 apiRouter.use('/hsm', hsmRoutes);
 apiRouter.use('/mpc', mpcRoutes);
 apiRouter.use('/merchants', merchantRoutes);
+apiRouter.use('/organizations', organizationRoutes);
+apiRouter.use('/invitations', invitationRoutes);
+apiRouter.use('/merchants/enhanced', enhancedMerchantRoutes);
 
 // Audit endpoints - Admin rate limiting with monitoring
 apiRouter.use('/audit', enhancedRateLimiter ? enhancedRateLimiter.enhancedRateLimit({
