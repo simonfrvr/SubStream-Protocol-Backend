@@ -23,6 +23,7 @@ import hsmRoutes from './routes/hsm';
 import { mpcRoutes } from './routes/mpc';
 import { auditRoutes } from './routes/audit';
 import { sandboxRoutes } from './routes/sandbox';
+import { merchantRoutes } from './routes/merchants';
 
 import { errorHandler } from './middleware/errorHandler';
 import { requestLogger } from './middleware/requestLogger';
@@ -216,6 +217,7 @@ apiRouter.use('/privacy/budget', privacyBudgetRoutes);
 apiRouter.use('/ipfs', ipfsRoutes);
 apiRouter.use('/hsm', hsmRoutes);
 apiRouter.use('/mpc', mpcRoutes);
+apiRouter.use('/merchants', merchantRoutes);
 
 // Audit endpoints - Admin rate limiting with monitoring
 apiRouter.use('/audit', enhancedRateLimiter ? enhancedRateLimiter.enhancedRateLimit({
